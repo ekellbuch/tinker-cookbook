@@ -50,6 +50,9 @@ math-rl = [
 modal = [
     "modal>=1.5.1",
 ]
+daytona = [
+    "daytona>=0.197.0",
+]
 multiplayer-rl = [
     "textarena>=0.7.4",
 ]
