@@ -233,15 +233,15 @@ class DaytonaSandbox(SandboxInterface):
         """Run a shell command in the sandbox.
 
         Uses a persistent session so state (cwd, env, shell variables)
-        carries across calls. A ``workdir`` argument is prepended as
-        ``cd <workdir> &&`` for per-call scoping without mutating
-        long-term session state.
+        carries across calls. A ``workdir`` argument runs the command in a
+        subshell (``(cd <workdir> && ...)``) so the directory change is scoped
+        to this call and does not mutate the session's long-term cwd.
         """
         cap = max_output_bytes if max_output_bytes is not None else self._max_stream_output_bytes
 
         await self._ensure_session()
 
-        full_command = f"cd {shlex.quote(workdir)} && {command}" if workdir else command
+        full_command = f"(cd {shlex.quote(workdir)} && {command})" if workdir else command
         try:
             response = await self._sandbox.process.execute_session_command(
                 _SESSION_ID,
@@ -265,21 +265,19 @@ class DaytonaSandbox(SandboxInterface):
     async def read_file(
         self, path: str, max_bytes: int | None = None, timeout: int = 60
     ) -> SandboxResult:
-        """Read a file from the sandbox via the Daytona filesystem API."""
-        try:
-            content = await asyncio.wait_for(self._sandbox.fs.download_file(path), timeout=timeout)
-        except DaytonaNotFoundError as e:
-            raise SandboxTerminatedError(str(e)) from e
-        except Exception as e:
-            return SandboxResult(stdout="", stderr=str(e), exit_code=-1)
+        """Read a file from the sandbox via a shell read.
 
-        if max_bytes is not None and len(content) > max_bytes:
-            content = content[:max_bytes]
-        return SandboxResult(
-            stdout=content.decode("utf-8", errors="replace"),
-            stderr="",
-            exit_code=0,
-        )
+        Uses ``cat``/``head -c`` rather than ``fs.download_file`` because the
+        filesystem API raises ``DaytonaNotFoundError`` for a *missing file*,
+        which is indistinguishable from a missing *sandbox* and would be
+        misreported as ``SandboxTerminatedError`` on a healthy sandbox. Going
+        through ``run_command`` instead yields a nonzero exit code for a
+        missing file while still raising ``SandboxTerminatedError`` when the
+        sandbox itself is gone.
+        """
+        quoted = shlex.quote(path)
+        cmd = f"head -c {max_bytes} {quoted}" if max_bytes is not None else f"cat {quoted}"
+        return await self.run_command(cmd, timeout=timeout)
 
     async def write_file(
         self,

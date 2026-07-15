@@ -29,7 +29,7 @@ requires_daytona = pytest.mark.skipif(
 )
 
 
-@pytest_asyncio.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def sandbox():
     """Shared Daytona sandbox for persistent-state tests in this module."""
     sb = await DaytonaSandbox.create(timeout=300)
@@ -50,7 +50,7 @@ async def _timed(coro):
 
 
 @requires_daytona
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(120)
 async def test_run_command_basic(sandbox):
     """run_command returns structured stdout/exit_code."""
@@ -60,7 +60,7 @@ async def test_run_command_basic(sandbox):
 
 
 @requires_daytona
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(120)
 async def test_run_command_state_persists(sandbox):
     """Shell state (cwd) persists across run_command calls via the session."""
@@ -73,7 +73,32 @@ async def test_run_command_state_persists(sandbox):
 
 
 @requires_daytona
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.timeout(120)
+async def test_workdir_does_not_leak_cwd(sandbox):
+    """A per-call workdir must not mutate the session's long-term cwd."""
+    before = (await sandbox.run_command("pwd")).stdout.strip()
+
+    scoped = await sandbox.run_command("pwd", workdir="/")
+    assert scoped.stdout.strip() == "/"
+
+    after = (await sandbox.run_command("pwd")).stdout.strip()
+    assert after == before, f"workdir leaked into the session cwd: {before!r} -> {after!r}"
+
+
+@requires_daytona
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.timeout(120)
+async def test_read_missing_file_is_not_termination(sandbox):
+    """Reading a missing file returns a nonzero exit code, not SandboxTerminatedError."""
+    result = await sandbox.read_file("/tmp/does_not_exist_xyz.txt")
+    assert result.exit_code != 0
+    # The sandbox is still alive after a missing-file read.
+    assert (await sandbox.run_command("echo alive")).stdout.strip() == "alive"
+
+
+@requires_daytona
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(120)
 async def test_filesystem_round_trip(sandbox):
     """write_file then read_file returns the same content."""
@@ -87,7 +112,7 @@ async def test_filesystem_round_trip(sandbox):
 
 
 @requires_daytona
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(120)
 async def test_write_file_executable(sandbox):
     """write_file(executable=True) makes the file executable."""
@@ -100,7 +125,7 @@ async def test_write_file_executable(sandbox):
 
 
 @requires_daytona
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(60)
 async def test_send_heartbeat(sandbox):
     """send_heartbeat succeeds on a live sandbox."""
@@ -113,7 +138,7 @@ async def test_send_heartbeat(sandbox):
 
 
 @requires_daytona
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(30)
 async def test_write_file_latency(sandbox):
     """write_file should complete in seconds, not minutes.
@@ -137,7 +162,7 @@ async def test_write_file_latency(sandbox):
 
 
 @requires_daytona
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(120)
 async def test_cleanup_is_idempotent():
     """Calling cleanup twice on the same sandbox does not raise."""
@@ -149,7 +174,7 @@ async def test_cleanup_is_idempotent():
 
 
 @requires_daytona
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(120)
 async def test_command_after_cleanup_raises_terminated():
     """run_command after cleanup surfaces SandboxTerminatedError."""
@@ -166,7 +191,7 @@ async def test_command_after_cleanup_raises_terminated():
 
 
 @requires_daytona
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(180)
 async def test_run_code_in_daytona_success():
     """run_code_in_daytona returns (True, {...stdout...}) on a working program."""
@@ -181,7 +206,7 @@ async def test_run_code_in_daytona_success():
 
 
 @requires_daytona
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(180)
 async def test_run_code_in_daytona_failure():
     """run_code_in_daytona returns (False, {...}) when the program raises."""
@@ -195,7 +220,7 @@ async def test_run_code_in_daytona_failure():
 
 
 @requires_daytona
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(180)
 async def test_run_code_in_daytona_with_files():
     """run_code_in_daytona uploads supporting files alongside the entry point."""
