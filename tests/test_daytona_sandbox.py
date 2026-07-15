@@ -1,8 +1,8 @@
 """Smoke tests for DaytonaSandbox.
 
 Daytona sibling of test_modal_sandbox.py. Require a Daytona API key and network
-access; skipped when DAYTONA_API_KEY is not set. The module is also skipped
-until the DaytonaSandbox backend exists.
+access; skipped when DAYTONA_API_KEY is not set, and skipped entirely unless the
+optional `daytona` dependency is installed.
 
 These exercise the SandboxInterface contract against a real backend
 (write_file / read_file / run_command / cleanup), guard against write_file
@@ -17,7 +17,9 @@ import time
 import pytest
 import pytest_asyncio
 
-# Skip the whole module until the Daytona backend is importable.
+from tinker_cookbook.sandbox.sandbox_interface import SandboxTerminatedError
+
+# Skip the whole module unless the optional daytona dependency is installed.
 daytona_sandbox = pytest.importorskip("tinker_cookbook.sandbox.daytona_sandbox")
 DaytonaSandbox = daytona_sandbox.DaytonaSandbox
 AsyncDaytona = pytest.importorskip("daytona").AsyncDaytona
@@ -100,6 +102,17 @@ async def test_read_file_roundtrip(sandbox):
 @requires_daytona
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(60)
+async def test_read_missing_file_is_not_termination(sandbox):
+    """Reading a missing file returns a nonzero exit code, not SandboxTerminatedError."""
+    result = await sandbox.read_file("/tmp/does_not_exist.txt")
+    assert result.exit_code != 0
+    # The sandbox is still alive after a missing-file read.
+    assert (await sandbox.run_command("echo alive")).stdout.strip() == "alive"
+
+
+@requires_daytona
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.timeout(60)
 async def test_run_command_exit_code(sandbox):
     """run_command should surface both success and nonzero exit codes."""
     ok = await sandbox.run_command("true")
@@ -137,6 +150,10 @@ async def test_cleanup_after_external_termination():
         await client.delete(target)
     finally:
         await client.close()
+
+    # send_heartbeat must report the death per the SandboxInterface contract.
+    with pytest.raises(SandboxTerminatedError):
+        await sb.send_heartbeat()
 
     # The wrapper's own cleanup must not raise even though the sandbox is gone.
     await sb.cleanup()

@@ -5,9 +5,6 @@ The sandbox/ directory provides thin wrappers around different sandbox backends:
 - SandboxFusionClient: HTTP-based sandbox using SandboxFusion Docker container
 - ModalSandbox: Cloud sandbox using Modal's infrastructure
 - DaytonaSandbox: Cloud sandbox using Daytona's infrastructure
-
-ModalSandbox and DaytonaSandbox depend on optional packages and are imported
-from their own modules on demand, not re-exported here.
 """
 
 from enum import StrEnum
@@ -23,7 +20,8 @@ from tinker_cookbook.sandbox.sandboxfusion import SandboxFusionClient
 class SandboxBackend(StrEnum):
     SANDBOXFUSION = "sandboxfusion"
     MODAL = "modal"
-    DAYTONA = "daytona"
+    # DAYTONA is intentionally omitted until the code_rl grader has a Daytona
+    # dispatch path; adding it now would make grading silently fail-closed.
 
 
 __all__ = [
