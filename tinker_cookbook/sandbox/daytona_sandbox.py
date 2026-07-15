@@ -204,8 +204,19 @@ class DaytonaSandbox(SandboxInterface):
     def sandbox_id(self) -> str:
         return self._sandbox.id
 
+    def _check_live(self) -> None:
+        """Raise if the sandbox was cleaned up.
+
+        After ``cleanup()`` the owned client is closed; calling into the SDK
+        would make it open a fresh, unclosed aiohttp session (leaking a file
+        descriptor per call). Fail fast instead.
+        """
+        if self._cleaned_up:
+            raise SandboxTerminatedError("sandbox has been cleaned up")
+
     async def _ensure_session(self) -> None:
         """Lazily create the shared background session used by ``run_command``."""
+        self._check_live()
         if self._session_ready:
             return
         async with self._session_lock:
@@ -218,6 +229,7 @@ class DaytonaSandbox(SandboxInterface):
                 raise SandboxTerminatedError(str(e)) from e
 
     async def send_heartbeat(self, timeout: int = 30) -> None:
+        self._check_live()
         try:
             await asyncio.wait_for(self._sandbox.refresh_activity(), timeout=timeout)
         except DaytonaNotFoundError as e:
@@ -287,6 +299,7 @@ class DaytonaSandbox(SandboxInterface):
         timeout: int = 60,
     ) -> SandboxResult:
         """Write content to a file in the sandbox."""
+        self._check_live()
         if isinstance(content, str):
             content = content.encode()
 
