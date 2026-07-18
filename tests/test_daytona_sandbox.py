@@ -25,6 +25,8 @@ requires_daytona = pytest.mark.skipif(
 )
 
 
+# loop_scope="module" is added because Daytona's client permanently binds to one
+# event loop, but pytest's default runs each test on a different event loop.
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def sandbox():
     """Shared Daytona sandbox for all tests in this module."""
