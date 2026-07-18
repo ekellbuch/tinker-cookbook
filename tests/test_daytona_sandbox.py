@@ -1,6 +1,6 @@
 """Smoke tests for DaytonaSandbox.
 
-Mirror ``tests/test_modal_sandbox.py``: the same five behaviors and no others.
+Mirror ``tests/test_modal_sandbox.py``.
 Require Daytona authentication and network access; skipped when no
 ``DAYTONA_API_KEY`` or ``DAYTONA_JWT_TOKEN`` is set in the environment.
 
