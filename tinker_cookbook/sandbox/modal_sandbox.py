@@ -319,12 +319,19 @@ class ModalSandboxPool:
                 )
 
             if files:
-                await asyncio.gather(
+                write_results = await asyncio.gather(
                     *(
                         sandbox.write_file(f"{workdir}/{filename}", content)
                         for filename, content in files.items()
                     )
                 )
+                for filename, write_result in zip(files, write_results, strict=True):
+                    if write_result.exit_code != 0:
+                        return SandboxResult(
+                            stdout="",
+                            stderr=f"Failed to write {filename}: {write_result.stderr}",
+                            exit_code=write_result.exit_code,
+                        )
             return await sandbox.run_command(
                 shlex.join(command), workdir=workdir, timeout=timeout or self._sandbox_timeout_secs
             )
