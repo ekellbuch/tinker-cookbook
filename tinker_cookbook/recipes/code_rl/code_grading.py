@@ -19,6 +19,7 @@ from tinker_cookbook.sandbox import SandboxBackend, SandboxFusionClient
 # Global sandbox backend clients (lazily initialized)
 _sandboxfusion_client: SandboxFusionClient | None = None
 _modal_pool: Any = None  # ModalSandboxPool, but avoid import at module level
+_daytona_pool: Any = None  # DaytonaSandboxPool, but avoid import at module level
 
 
 def _get_sandboxfusion_client() -> SandboxFusionClient:
@@ -40,6 +41,19 @@ def _get_modal_pool():
         image = modal.Image.debian_slim().pip_install("numpy")
         _modal_pool = ModalSandboxPool(image=image)
     return _modal_pool
+
+
+def _get_daytona_pool():
+    """Get or create the Daytona sandbox pool."""
+    global _daytona_pool
+    if _daytona_pool is None:
+        from daytona import Image
+
+        from tinker_cookbook.sandbox.daytona_sandbox import DaytonaSandboxPool
+
+        image = Image.debian_slim().pip_install("numpy")
+        _daytona_pool = DaytonaSandboxPool(image=image)
+    return _daytona_pool
 
 
 def extract_code_from_model(model_response: str) -> str | None:
@@ -124,18 +138,22 @@ async def _check_with_daytona(
     total_timeout: int,
 ) -> tuple[bool, dict[str, Any]]:
     """Execute tests using Daytona sandbox."""
-    # Lazy-import so users without the [daytona] extra are unaffected.
-    from tinker_cookbook.sandbox.daytona_sandbox import run_code_in_daytona
-
-    return await run_code_in_daytona(
-        code=TEST_CODE % {"timeout": timeout},
+    pool = _get_daytona_pool()
+    result = await pool.run_in_workdir(
         files={
             "test_cases.txt": json.dumps(test_cases),
             "code.py": generation,
             "testing_util.py": TEST_UTIL,
+            "run.py": TEST_CODE % {"timeout": timeout},
         },
+        command=["python", "run.py"],
         timeout=total_timeout,
     )
+    return result.exit_code == 0, {
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
 
 
 async def sandbox_check_correctness(

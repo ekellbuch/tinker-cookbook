@@ -1,22 +1,20 @@
 """
-Thin wrapper around Daytona Sandbox API.
+Thin wrapper around the Daytona Sandbox API.
 
-Daytona provides cloud-based sandboxed execution environments.
+Daytona provides cloud-based sandboxed execution environments. This module is
+the provider-specific equivalent of ``modal_sandbox.py``: it exposes the same
+public capabilities, lifecycle semantics, pooling behavior, and Harbor
+integration as the Modal backend. Differences exist only where the Daytona SDK
+requires a different implementation.
+
 Requires Daytona authentication: ``export DAYTONA_API_KEY=...``
 (or ``DAYTONA_JWT_TOKEN`` + ``DAYTONA_ORGANIZATION_ID``).
 
-Supports two usage modes:
-
-- Stateful: a persistent sandbox where shell state (cwd, env, variables)
-  carries across calls. Used for multi-turn agentic workloads.
-- Stateless: an ephemeral sandbox per call, for one-shot code grading.
-
 Configuration via environment variables:
-    DAYTONA_API_URL: API endpoint (default: https://app.daytona.io/api)
-    DAYTONA_TARGET: Target region for sandbox placement
-    DAYTONA_SNAPSHOT: Pre-created snapshot name. Not required —
-        image builds are content-hashed and cached across sandboxes
-        automatically. Use this only to pin a specific pre-built snapshot.
+    DAYTONA_POOL_SIZE: Number of sandboxes in the pool (default: 32)
+    DAYTONA_CREATION_RATE_LIMIT: Max sandboxes created per maintenance step (default: 4)
+    DAYTONA_SNAPSHOT: Optional pre-created snapshot name. Not required — image
+        builds are content-hashed and cached across sandboxes automatically.
 
 See: https://www.daytona.io
 """
@@ -28,6 +26,7 @@ import contextlib
 import logging
 import os
 import shlex
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +39,6 @@ try:
         DaytonaNotFoundError,
         FileUpload,
         Image,
-        SessionExecuteRequest,
     )
 except ImportError:
     raise ImportError(
@@ -49,6 +47,7 @@ except ImportError:
         "git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'"
     ) from None
 
+from tinker_cookbook.exceptions import SandboxError
 from tinker_cookbook.sandbox.sandbox_interface import (
     SandboxInterface,
     SandboxResult,
@@ -60,9 +59,10 @@ logger = logging.getLogger(__name__)
 
 def _cap_output(text: str, max_bytes: int) -> str:
     """Cap a string to *max_bytes* bytes of UTF-8, decoding safely at the boundary."""
-    encoded = text.encode("utf-8", errors="replace")
+    candidate = text[:max_bytes]
+    encoded = candidate.encode("utf-8", errors="replace")
     if len(encoded) <= max_bytes:
-        return text
+        return candidate
     return encoded[:max_bytes].decode("utf-8", errors="replace")
 
 
@@ -72,17 +72,16 @@ def _cap_output(text: str, max_bytes: int) -> str:
 _DEFAULT_AUTO_STOP_MINUTES = 15
 _DEFAULT_AUTO_DELETE_MINUTES = 30
 _DEFAULT_MAX_OUTPUT_BYTES = 128 * 1024
-_SESSION_ID = "tinker-cookbook-shell"
 
 
 class DaytonaSandbox(SandboxInterface):
     """
-    Persistent Daytona sandbox that implements :class:`SandboxInterface`.
+    Persistent Daytona sandbox for code execution. Conforms to SandboxInterface.
 
-    State persists across ``run_command`` calls via a long-running background
-    session (``sandbox.process.create_session`` + ``execute_session_command``).
-
-    For stateless per-call grading, prefer :func:`run_code_in_daytona`.
+    Matches :class:`ModalSandbox`: each ``run_command`` executes independently in
+    a fresh shell (via ``process.exec``), so shell state (cwd, exported env,
+    shell variables) does not persist across calls. Filesystem changes persist
+    because they are changes to the sandbox filesystem.
 
     Usage:
         sandbox = await DaytonaSandbox.create()
@@ -104,9 +103,8 @@ class DaytonaSandbox(SandboxInterface):
         self._sandbox = sandbox
         self._max_stream_output_bytes = max_stream_output_bytes
         self._owns_client = owns_client
-        self._session_ready = False
-        self._session_lock = asyncio.Lock()
         self._cleaned_up = False
+        self._cleanup_lock = asyncio.Lock()
 
     @classmethod
     async def create(
@@ -117,36 +115,29 @@ class DaytonaSandbox(SandboxInterface):
         timeout: int = 600,
         auto_stop_minutes: int | None = None,
         auto_delete_minutes: int | None = None,
-        labels: dict[str, str] | None = None,
-        env_vars: dict[str, str] | None = None,
-        target: str | None = None,
         max_stream_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
         client: AsyncDaytona | None = None,
     ) -> DaytonaSandbox:
         """Create a new Daytona sandbox.
 
         Args:
-            image: Image to use. Mutually exclusive with *snapshot*. If
-                both are ``None`` (and ``DAYTONA_SNAPSHOT`` is unset),
-                defaults to ``Image.debian_slim()``. Image builds are
-                cached by Daytona across sandboxes, so passing the same
-                image repeatedly does not re-build.
-            snapshot: Name of a pre-created Daytona snapshot. Mutually
-                exclusive with *image*. Falls back to ``DAYTONA_SNAPSHOT``
-                env var if unset.
+            image: Image to use. Mutually exclusive with *snapshot*. If both are
+                ``None`` (and ``DAYTONA_SNAPSHOT`` is unset), defaults to
+                ``Image.debian_slim()``. Image builds are cached by Daytona
+                across sandboxes, so passing the same image repeatedly does not
+                re-build.
+            snapshot: Name of a pre-created Daytona snapshot. Mutually exclusive
+                with *image*. Falls back to ``DAYTONA_SNAPSHOT`` if unset.
             timeout: Max wait time in seconds for sandbox creation.
-            auto_stop_minutes: Minutes of inactivity before auto-stop.
-                ``0`` disables. Defaults to 15.
-            auto_delete_minutes: Minutes after stopping before auto-delete.
-                ``0`` means delete immediately, negative disables. Defaults
-                to 30. Leak protection if ``cleanup()`` is skipped.
-            labels: Custom labels attached to the sandbox.
-            env_vars: Environment variables set inside the sandbox.
-            target: Target region for sandbox placement.
-            max_stream_output_bytes: Cap per-stream output at this many
-                bytes. Defaults to 128 KB.
-            client: Existing ``AsyncDaytona`` client to reuse. If ``None``,
-                a new client is created and owned by this sandbox.
+            auto_stop_minutes: Minutes of inactivity before auto-stop. ``0``
+                disables. Defaults to 15.
+            auto_delete_minutes: Minutes after stopping before auto-delete. ``0``
+                means delete immediately, negative disables. Defaults to 30.
+                Leak protection if ``cleanup()`` is skipped.
+            max_stream_output_bytes: Cap per-stream output at this many bytes.
+                Defaults to 128 KB.
+            client: Existing ``AsyncDaytona`` client to reuse (e.g. from a pool).
+                If ``None``, a new client is created and owned by this sandbox.
         """
         if image is not None and snapshot is not None:
             raise ValueError("Provide either image or snapshot, not both.")
@@ -160,8 +151,7 @@ class DaytonaSandbox(SandboxInterface):
 
         owns_client = client is None
         if owns_client:
-            config = DaytonaConfig(target=target) if target is not None else DaytonaConfig()
-            client = AsyncDaytona(config)
+            client = AsyncDaytona(DaytonaConfig())
         assert client is not None  # for type checker
 
         try:
@@ -172,8 +162,6 @@ class DaytonaSandbox(SandboxInterface):
                         snapshot=resolved_snapshot,
                         auto_stop_interval=resolved_auto_stop,
                         auto_delete_interval=resolved_auto_delete,
-                        labels=labels,
-                        env_vars=env_vars,
                     )
                 )
             else:
@@ -182,8 +170,6 @@ class DaytonaSandbox(SandboxInterface):
                     image=resolved_image,
                     auto_stop_interval=resolved_auto_stop,
                     auto_delete_interval=resolved_auto_delete,
-                    labels=labels,
-                    env_vars=env_vars,
                 )
             sandbox = await client.create(params, timeout=float(timeout))
         except Exception:
@@ -205,28 +191,15 @@ class DaytonaSandbox(SandboxInterface):
         return self._sandbox.id
 
     def _check_live(self) -> None:
-        """Raise if the sandbox was cleaned up.
+        """Raise ``SandboxTerminatedError`` if the sandbox was already cleaned up.
 
-        After ``cleanup()`` the owned client is closed; calling into the SDK
-        would make it open a fresh, unclosed aiohttp session (leaking a file
-        descriptor per call). Fail fast instead.
+        After ``cleanup()`` the sandbox is deleted (and an owned client closed);
+        calling into the SDK afterwards would either error or reopen a fresh,
+        unclosed aiohttp session. This mirrors Modal, where a command against a
+        terminated sandbox surfaces as ``SandboxTerminatedError``.
         """
         if self._cleaned_up:
             raise SandboxTerminatedError("sandbox has been cleaned up")
-
-    async def _ensure_session(self) -> None:
-        """Lazily create the shared background session used by ``run_command``."""
-        self._check_live()
-        if self._session_ready:
-            return
-        async with self._session_lock:
-            if self._session_ready:
-                return
-            try:
-                await self._sandbox.process.create_session(_SESSION_ID)
-                self._session_ready = True
-            except DaytonaNotFoundError as e:
-                raise SandboxTerminatedError(str(e)) from e
 
     async def send_heartbeat(self, timeout: int = 30) -> None:
         self._check_live()
@@ -244,33 +217,27 @@ class DaytonaSandbox(SandboxInterface):
     ) -> SandboxResult:
         """Run a shell command in the sandbox.
 
-        Uses a persistent session so state (cwd, env, shell variables)
-        carries across calls. A ``workdir`` argument runs the command in a
-        subshell (``(cd <workdir> && ...)``) so the directory change is scoped
-        to this call and does not mutate the session's long-term cwd.
+        Each call executes independently in a fresh shell via ``process.exec``,
+        so cwd changes and exported environment variables do not persist across
+        calls. ``workdir`` applies only to this command; ``workdir=None`` uses
+        the image's default working directory.
         """
+        self._check_live()
         cap = max_output_bytes if max_output_bytes is not None else self._max_stream_output_bytes
-
-        await self._ensure_session()
-
-        full_command = f"(cd {shlex.quote(workdir)} && {command})" if workdir else command
         try:
-            response = await self._sandbox.process.execute_session_command(
-                _SESSION_ID,
-                SessionExecuteRequest(command=full_command),
-                timeout=timeout,
-            )
+            response = await self._sandbox.process.exec(command, cwd=workdir, timeout=timeout)
         except DaytonaNotFoundError as e:
             raise SandboxTerminatedError(str(e)) from e
         except Exception as e:
             return SandboxResult(stdout="", stderr=str(e), exit_code=-1)
 
         exit_code = response.exit_code if response.exit_code is not None else -1
-        stdout = response.stdout or ""
-        stderr = response.stderr or ""
+        # Daytona's exec returns combined output as a single ``result`` stream;
+        # unlike Modal there is no separate stderr channel for a normal exit.
+        stdout = response.result or ""
         return SandboxResult(
             stdout=_cap_output(stdout, cap),
-            stderr=_cap_output(stderr, cap),
+            stderr="",
             exit_code=exit_code,
         )
 
@@ -279,13 +246,13 @@ class DaytonaSandbox(SandboxInterface):
     ) -> SandboxResult:
         """Read a file from the sandbox via a shell read.
 
-        Uses ``cat``/``head -c`` rather than ``fs.download_file`` because the
-        filesystem API raises ``DaytonaNotFoundError`` for a *missing file*,
-        which is indistinguishable from a missing *sandbox* and would be
-        misreported as ``SandboxTerminatedError`` on a healthy sandbox. Going
-        through ``run_command`` instead yields a nonzero exit code for a
-        missing file while still raising ``SandboxTerminatedError`` when the
-        sandbox itself is gone.
+        Uses ``cat``/``head -c`` through ``run_command`` rather than
+        ``fs.download_file`` because the filesystem API raises
+        ``DaytonaNotFoundError`` for a *missing file*, which is indistinguishable
+        from a missing *sandbox* and would be misreported as
+        ``SandboxTerminatedError`` on a healthy sandbox. Going through
+        ``run_command`` yields a nonzero exit code for a missing file while still
+        raising ``SandboxTerminatedError`` when the sandbox itself is gone.
         """
         quoted = shlex.quote(path)
         cmd = f"head -c {max_bytes} {quoted}" if max_bytes is not None else f"cat {quoted}"
@@ -298,7 +265,11 @@ class DaytonaSandbox(SandboxInterface):
         executable: bool = False,
         timeout: int = 60,
     ) -> SandboxResult:
-        """Write content to a file in the sandbox."""
+        """Write content to a file in the sandbox.
+
+        Uses Daytona's native ``fs.upload_files`` (a multipart HTTP POST) rather
+        than piping through stdin. Binary content is written exactly as-is.
+        """
         self._check_live()
         if isinstance(content, str):
             content = content.encode()
@@ -320,19 +291,178 @@ class DaytonaSandbox(SandboxInterface):
         return SandboxResult(stdout="", stderr="", exit_code=0)
 
     async def cleanup(self) -> None:
-        """Delete the sandbox and close the owned Daytona client, idempotently."""
-        if self._cleaned_up:
-            return
-        self._cleaned_up = True
+        """Delete the sandbox and close the owned Daytona client, idempotently.
 
-        # Both steps are best-effort so a double-cleanup or a sandbox that
-        # Daytona already auto-reaped does not surface as an exception.
-        with contextlib.suppress(Exception):
-            await self._client.delete(self._sandbox)
+        Safe to call twice and safe to call after the sandbox has already been
+        auto-reaped: provider "not found"/"already deleted" errors are
+        suppressed. If the client is borrowed from a pool it is left open.
+        """
+        async with self._cleanup_lock:
+            if self._cleaned_up:
+                return
+            self._cleaned_up = True
 
-        if self._owns_client:
             with contextlib.suppress(Exception):
-                await self._client.close()
+                await self._client.delete(self._sandbox)
+
+            if self._owns_client:
+                with contextlib.suppress(Exception):
+                    await self._client.close()
+
+
+class DaytonaSandboxPool:
+    """
+    Pool of Daytona sandboxes for concurrent execution.
+
+    Provider-specific equivalent of :class:`ModalSandboxPool`. Each sandbox
+    handles one request at a time; a used sandbox is terminated and replaced
+    rather than returned to the warm pool. A single ``AsyncDaytona`` client is
+    shared across the pool as an internal implementation detail.
+
+    Configuration via environment variables:
+        DAYTONA_POOL_SIZE: Number of sandboxes in the pool (default: 32)
+        DAYTONA_CREATION_RATE_LIMIT: Max sandboxes created per maintenance step
+            (default: 4)
+    """
+
+    def __init__(
+        self,
+        *,
+        pool_size: int | None = None,  # Number of warm sandboxes to maintain during the job run.
+        sandbox_timeout_secs: int = 1200,  # Lifetime after which a sandbox is auto-stopped.
+        image: Image | str | None = None,
+        snapshot: str | None = None,
+    ):
+        self._pool_size = pool_size or int(os.getenv("DAYTONA_POOL_SIZE", "32"))
+        self._creation_rate_limit = int(os.getenv("DAYTONA_CREATION_RATE_LIMIT", "4"))
+        self._sandbox_timeout_secs = sandbox_timeout_secs
+        self._image = image
+        self._snapshot = snapshot
+        self._terminated = False
+        self._client = AsyncDaytona(DaytonaConfig())
+
+        self._warm_pool: asyncio.Queue[DaytonaSandbox] = asyncio.Queue()  # Warm pool of sandboxes.
+        self._to_terminate: list[DaytonaSandbox] = []  # Sandboxes pending termination.
+        self._active_count = 0  # Number of in-use sandboxes.
+
+        asyncio.create_task(self._maintain_pool())
+
+    async def _create(self) -> DaytonaSandbox:
+        return await DaytonaSandbox.create(
+            image=self._image,
+            snapshot=self._snapshot,
+            timeout=self._sandbox_timeout_secs,
+            auto_stop_minutes=max(1, self._sandbox_timeout_secs // 60),
+            client=self._client,
+        )
+
+    async def _maintain_pool(self) -> None:
+        """Background task to handle all sandbox creation and termination."""
+        while not self._terminated:
+            try:
+                await self._maintain_pool_step()
+            except Exception as e:
+                logger.error(f"Error maintaining DaytonaSandboxPool: {e}")
+            await asyncio.sleep(1.0)
+
+    async def _maintain_pool_step(self) -> None:
+        """Single iteration of pool maintenance: terminate used sandboxes, create new ones."""
+        # Batch terminate used sandboxes
+        if self._to_terminate:
+            to_terminate, self._to_terminate = self._to_terminate, []
+            await asyncio.gather(*(sb.cleanup() for sb in to_terminate))
+
+        # Create new sandboxes in parallel (respecting rate limit)
+        total = self._warm_pool.qsize() + self._active_count
+        need = min(self._creation_rate_limit, self._pool_size - total)
+        if need > 0:
+            new_sandboxes = await asyncio.gather(
+                *(self._create() for _ in range(need)),
+                return_exceptions=True,
+            )
+            for sb in new_sandboxes:
+                if isinstance(sb, BaseException):
+                    logger.error(f"Error creating Daytona sandbox: {sb}")
+                else:
+                    await self._warm_pool.put(sb)
+
+    async def run_in_workdir(
+        self,
+        files: dict[str, str],
+        command: list[str],
+        timeout: int | None = None,
+    ) -> SandboxResult:
+        """
+        Execute command with files using an available sandbox from the pool.
+        If all sandboxes are busy, waits until one becomes available.
+
+        Creates an isolated workdir, writes files, and runs the command.
+
+        Args:
+            files: Files to write {filename: content}
+            command: Command and arguments (e.g., ["python", "run.py"])
+            timeout: Execution timeout in seconds
+        """
+        if self._terminated:
+            raise SandboxError("DaytonaSandboxPool has been terminated.")
+
+        sandbox = await self._warm_pool.get()
+        self._active_count += 1
+
+        try:
+            workdir = f"/workspace/{uuid.uuid4().hex[:12]}"
+            result = await sandbox.run_command(
+                f"mkdir -p {shlex.quote(workdir)}", timeout=timeout or 60
+            )
+            if result.exit_code != 0:
+                return SandboxResult(
+                    stdout="",
+                    stderr=f"Failed to create workdir: {workdir}",
+                    exit_code=result.exit_code,
+                )
+
+            if files:
+                write_results = await asyncio.gather(
+                    *(
+                        sandbox.write_file(f"{workdir}/{filename}", content)
+                        for filename, content in files.items()
+                    )
+                )
+                for filename, write_result in zip(files, write_results, strict=True):
+                    if write_result.exit_code != 0:
+                        return SandboxResult(
+                            stdout="",
+                            stderr=f"Failed to write {filename}: {write_result.stderr}",
+                            exit_code=write_result.exit_code,
+                        )
+
+            return await sandbox.run_command(
+                shlex.join(command), workdir=workdir, timeout=timeout or self._sandbox_timeout_secs
+            )
+        finally:
+            self._active_count -= 1
+            self._to_terminate.append(sandbox)
+
+    async def terminate(self) -> None:
+        """Exit the pool, terminate all sandboxes, and close the shared client."""
+        self._terminated = True
+
+        # Wait for active sandboxes to finish and be added to _to_terminate
+        while self._active_count > 0:
+            await asyncio.sleep(0.5)
+
+        # Collect and terminate all sandboxes
+        all_sandboxes = list(self._to_terminate)
+        while not self._warm_pool.empty():
+            try:
+                all_sandboxes.append(self._warm_pool.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        await asyncio.gather(*(sb.cleanup() for sb in all_sandboxes))
+
+        # Close the shared client once, after all sandboxes are gone.
+        with contextlib.suppress(Exception):
+            await self._client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -343,96 +473,25 @@ class DaytonaSandbox(SandboxInterface):
 async def daytona_sandbox_factory(env_dir: Path, timeout: int) -> DaytonaSandbox:
     """Create a Daytona sandbox from a Harbor task environment directory.
 
+    Provider-specific equivalent of Modal's Harbor factory. ``env_dir`` is used
+    as the Docker build context: ``Image.from_dockerfile`` archives the
+    Dockerfile's ``COPY``/``ADD`` sources relative to ``env_dir``, so those
+    instructions resolve against the task environment just as they do on Modal.
+
     Signature matches ``harbor_env.SandboxFactory``.
 
     Args:
-        env_dir: Path to the task's ``environment/`` directory (must
-            contain a ``Dockerfile``).
+        env_dir: Path to the task's ``environment/`` directory (must contain a
+            ``Dockerfile``).
         timeout: Max wait time in seconds for sandbox creation.
     """
     dockerfile_path = env_dir / "Dockerfile"
-    image = Image.from_dockerfile(dockerfile_path)
+    image = Image.from_dockerfile(str(dockerfile_path))
     return await DaytonaSandbox.create(image=image, timeout=timeout)
-
-
-# ---------------------------------------------------------------------------
-# Stateless code grading helper (for code_rl)
-# ---------------------------------------------------------------------------
-
-
-async def run_code_in_daytona(
-    code: str,
-    files: dict[str, str],
-    timeout: float,
-    language: str = "python",
-    snapshot: str | None = None,
-) -> tuple[bool, dict[str, Any]]:
-    """Execute code in an ephemeral Daytona sandbox for stateless grading.
-
-    Return shape matches :meth:`SandboxFusionClient.run` so this slots
-    into ``code_rl.code_grading`` as a peer backend without re-shaping
-    the caller.
-
-    Args:
-        code: Main code to execute (entry point — written as ``run.py``).
-        files: Additional files to include ``{filename: content}``.
-        timeout: Execution timeout in seconds.
-        language: Programming language (default: ``python``).
-        snapshot: Optional pre-created Daytona snapshot name for fast cold
-            start. Falls back to ``DAYTONA_SNAPSHOT`` env var, then to
-            ``Image.debian_slim()``.
-
-    Returns:
-        Tuple of ``(success: bool, response: dict)``. ``success`` is True
-        only when the process exited with code 0. ``response`` contains
-        ``exit_code``, ``stdout``, ``stderr``.
-    """
-    if language != "python":
-        return False, {"error": f"Unsupported language for Daytona grading: {language!r}"}
-
-    sandbox: DaytonaSandbox | None = None
-    try:
-        # Allow a generous creation budget on top of the execution timeout
-        # so a slow first-time image build does not kill the sandbox before
-        # the user's code starts.
-        #
-        # The default image installs numpy because the code_rl test harness
-        # (`testing_util.py`) imports it. Users passing a custom `snapshot=`
-        # are responsible for providing the runtime deps they need.
-        image: Image | None = None
-        if snapshot is None and not os.getenv("DAYTONA_SNAPSHOT"):
-            image = Image.debian_slim().pip_install("numpy")
-        sandbox = await DaytonaSandbox.create(
-            image=image, snapshot=snapshot, timeout=int(timeout) + 60
-        )
-
-        all_files = [
-            ("/workspace/run.py", code),
-            *[(f"/workspace/{name}", content) for name, content in files.items()],
-        ]
-        await asyncio.gather(*(sandbox.write_file(path, content) for path, content in all_files))
-
-        result = await sandbox.run_command(
-            "python run.py",
-            workdir="/workspace",
-            timeout=int(timeout),
-        )
-    except Exception as e:
-        return False, {"error": str(e)}
-    finally:
-        if sandbox is not None:
-            await sandbox.cleanup()
-
-    success = result.exit_code == 0
-    return success, {
-        "exit_code": result.exit_code,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-    }
 
 
 __all__ = [
     "DaytonaSandbox",
+    "DaytonaSandboxPool",
     "daytona_sandbox_factory",
-    "run_code_in_daytona",
 ]

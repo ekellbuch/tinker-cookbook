@@ -68,7 +68,7 @@ Environment variables:
 
 ### Daytona (cloud)
 
-[Daytona Sandboxes](https://www.daytona.io) provide cloud-based isolated execution environments. Requires `DAYTONA_API_KEY` (or `DAYTONA_JWT_TOKEN` + `DAYTONA_ORGANIZATION_ID`).
+[Daytona Sandboxes](https://www.daytona.io) provide cloud-based isolated execution environments. Daytona is the provider-specific equivalent of the Modal backend and exposes the same public API (`DaytonaSandbox`, `DaytonaSandboxPool`, Harbor factory). Requires `DAYTONA_API_KEY` (or `DAYTONA_JWT_TOKEN` + `DAYTONA_ORGANIZATION_ID`).
 
 Install the extra:
 
@@ -76,29 +76,29 @@ Install the extra:
 uv pip install 'tinker-cookbook[daytona] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
 ```
 
-Example usage (stateful, implements `SandboxInterface`):
+Example usage:
 
 ```python
-from tinker_cookbook.sandbox.daytona_sandbox import DaytonaSandbox
+from tinker_cookbook.sandbox.daytona_sandbox import DaytonaSandbox, DaytonaSandboxPool
 
+# Single sandbox (conforms to SandboxInterface). Each run_command runs in a
+# fresh shell — cwd and env do not persist across calls, matching Modal.
 sandbox = await DaytonaSandbox.create()
 await sandbox.write_file("/workspace/code.py", "print('hello')")
 result = await sandbox.run_command("python /workspace/code.py", workdir="/workspace")
 print(result.stdout)
 await sandbox.cleanup()
-```
 
-Example usage (stateless grading, drop-in for `code_rl`):
-
-```python
-from tinker_cookbook.sandbox.daytona_sandbox import run_code_in_daytona
-
-success, response = await run_code_in_daytona(
-    code="print(2 + 2)",
-    files={"data.txt": "some content"},
-    timeout=30,
+# Pool for concurrent execution (recommended for RL workloads)
+pool = DaytonaSandboxPool(pool_size=32)
+result = await pool.run_in_workdir(
+    files={"code.py": "print('hello')"},
+    command=["python", "code.py"],
 )
+print(result.stdout)
 ```
+
+Select the backend for code grading with `sandbox_backend=daytona`.
 
 Harbor-style per-task Dockerfiles (drop-in for `harbor_rl`):
 
@@ -109,4 +109,8 @@ from tinker_cookbook.sandbox.daytona_sandbox import daytona_sandbox_factory
 # HarborDatasetBuilder / HarborEnvGroupBuilder constructors.
 ```
 
-Optional: set `DAYTONA_SNAPSHOT` to a pre-created snapshot name to skip image builds. Not required — image builds are cached automatically across sandboxes.
+Environment variables:
+
+- `DAYTONA_POOL_SIZE`: Number of sandboxes in the pool (default: 32)
+- `DAYTONA_CREATION_RATE_LIMIT`: Max sandboxes created per maintenance step (default: 4)
+- `DAYTONA_SNAPSHOT` (optional): pre-created snapshot name to skip image builds. Not required — image builds are cached automatically across sandboxes.
